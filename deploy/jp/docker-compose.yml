@@ -1,0 +1,63 @@
+# ============================================================
+# kiro2claude — VPS JP (35.200.50.7, GCP Tokyo e2-small, x86_64)
+# ============================================================
+# 消费者是同一台机上的 new-api（Docker 内网，`shared-net`）。
+# **不发布 host port、不接 Cloudflare Tunnel** —— 这个网关没有任何
+# login/admin HTTP 端点，加 Kiro 账号走 `docker exec`（见 README.md），
+# 所以公网暴露纯属多余攻击面。
+#
+# 部署位置约定：/home/docker/kiro2claude/
+# ============================================================
+
+services:
+  kiro2claude:
+    image: ghcr.io/yupanzi/kiro2claude:1.6.3
+    container_name: kiro2claude
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 必须 0.0.0.0 —— 默认 127.0.0.1 只绑容器 loopback，new-api 过不来
+      KIRO2CLAUDE_HOST: "0.0.0.0"
+      KIRO2CLAUDE_PORT: "8080"
+      KIRO2CLAUDE_REGION: "us-east-1"
+
+      # SSE 长连接全程占住一个上游 socket，这是「最大并发会话数」而非瞬时并发。
+      # 上游默认 100；单账号自用 20 足够，1.9 GB 的机器不必给这么大。
+      KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS: "20"
+
+      # 与下面的 mem_limit 配对：不设的话 V8 会按宿主 2 GB 推算 old-space，
+      # 在容器 cgroup 撞墙前不触发 GC → 直接被 OOM killer 干掉。
+      NODE_OPTIONS: "--max-old-space-size=512"
+
+      # KIRO2CLAUDE_CAPTURE_EMPTY_DIR 刻意不设：它会把完整 request body
+      # （system prompt + 对话历史 + 可能的密钥）明文落盘，无脱敏无轮转。
+
+    networks:
+      - shared-net
+
+    volumes:
+      # kiro-cli 的 SQLite 凭据（device code flow token + rotating refresh token）。
+      # 镜像里 HOME=/home/kiro，KIRO2CLAUDE_SQLITE_DB_PATH 已指向这条路径，
+      # 所以只挂这一个卷即可持久化。
+      #
+      # 不要改成 bind mount 到宿主目录再在宿主上另跑 kiro-cli —— refresh token
+      # 是 rotating 的，两边各自 refresh 会让一边立刻失效。
+      - kiro2claude-home:/home/kiro/.local/share/kiro-cli
+
+    # 1.9 GB 的机器上还跑着 new-api + postgres + redis + cli-proxy-api，
+    # 给个上限防止单个进程吃光。不够用就调大（连同 NODE_OPTIONS 一起）。
+    mem_limit: 768m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # new-api-prod 已经在这个网络上，容器名即主机名。
+  shared-net:
+    external: true
+
+volumes:
+  kiro2claude-home:
