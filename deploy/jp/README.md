@@ -34,22 +34,57 @@ cp .env.example .env
 openssl rand -hex 32   # 填进 .env 的 KIRO2CLAUDE_API_KEY
 ```
 
-### 1. 先登录，再启动 —— 顺序不能反
+`.env` 里还要填 IdC 的 `KIRO2CLAUDE_LOGIN_START_URL`（`https://d-xxx.awsapps.com/start`）
+和 `KIRO2CLAUDE_LOGIN_REGION`。这两个刻意放 `.env` 不放 compose —— start URL
+含 IdC 目录 ID，而 compose 是要进 git 的。
 
-没有凭据时 `loadCredentialsFromEnv()` 会抛错 → `process.exit(1)`，
-配上 `restart: unless-stopped` 就是**无限重启循环**。所以第一次必须先用
-一次性容器完成登录，把凭据写进命名卷，再 `up -d`。
+### 1. 启动并完成 device flow（IAM Identity Center）
+
+本账号走 IdC，所以 `.env` 里填了 `KIRO2CLAUDE_LOGIN_START_URL` 之后，登录是
+**容器自动完成**的 —— `index.ts` 在加载凭据之前先跑 `runBootstrapLogin`，它会：
+
+1. `kiro-cli whoami` 判断是否已登录（比任何文件大小启发式都可靠：全新 schema
+   的空 DB 也有 28 KB）
+2. 没登录就 spawn `kiro-cli login --use-device-flow --license pro
+   --identity-provider <START_URL> --region <LOGIN_REGION>`，把 device flow URL
+   实时转发到日志
+3. **登录成功后自动跑 `kiro-cli profile`** 写入 profileArn
 
 ```bash
-docker compose run --rm --entrypoint /bin/sh kiro2claude -c '
-  unset KIRO2CLAUDE_API_KEY
-  script -qec "kiro-cli login --use-device-flow --license free" /dev/null
-'
+docker compose up -d
+docker compose logs -f
 ```
 
 日志里会打出 device flow URL 和 user code，在任意一台机器的浏览器打开完成认证。
+成功后应看到「启动自检完成：凭据就绪」。
 
-**三个必须照抄的细节：**
+**盯着日志做这一步。** device flow 超时（默认 10 分钟）会让启动失败退出，
+`restart: unless-stopped` 会重来一轮 —— 不是死循环，但会浪费一轮等待。
+
+后续重启这条路径是幂等的：`whoami` 通过 → 只重跑一次 profile 激活（几秒）。
+凭据被清掉时它还会自己重新 bootstrap，算是自愈。
+
+### 2. profile 激活：IdC 自动，Builder ID 手动
+
+device flow **只写 token，不写** `state.api.codewhisperer.profile`，而上游
+`GetUsageLimits` 严格要求 `profileArn`，缺了就是 `400 Invalid profileArn` ——
+`/kiro/usage` 直接不可用。走 IdC 自动 bootstrap 的话 `runBootstrapLogin` 已经
+替你跑了，不用管。
+
+**只有 Builder ID（`--license free`）用户需要手动两步**：`index.ts` 的 bootstrap
+入口以 `config.loginStartUrl` 为开关，而 `bootstrap-login.ts` 一定会传
+`--identity-provider`，所以 Builder ID 根本进不了这条路径：
+
+```bash
+# 仅 Builder ID 需要
+docker compose run --rm --entrypoint /bin/sh kiro2claude -c '
+  unset KIRO2CLAUDE_API_KEY
+  script -qec "kiro-cli login --use-device-flow --license free" /dev/null
+  script -qec "kiro-cli profile" /dev/null       # TUI 起来后按 Enter
+'
+```
+
+两个必须照抄的细节（手动跑才会遇到）：
 
 1. **`unset KIRO2CLAUDE_API_KEY`** —— kiro-cli 自己也读这个环境变量，把它当作
    「已经用 API key 认证过」的标志，进而**拒绝执行 login**。容器 env 里有它，
@@ -57,33 +92,9 @@ docker compose run --rm --entrypoint /bin/sh kiro2claude -c '
    （网关自己 spawn kiro-cli 时由 `src/kiro/subprocess-env.ts` 剥掉，手动跑时得自己来。）
 2. **`script -qec ... /dev/null`** —— kiro-cli 必须有 PTY。非 TTY 环境下交互式
    prompt 直接返回空串，region 校验会爆 `invalid host label`。
-3. **`--license free` 对应 Builder ID**；用 IAM Identity Center 的话改成
-   `--license pro --identity-provider https://xxx.awsapps.com/start --region us-east-1`。
 
-### 2. 激活 profile —— 不做的话 `/kiro/usage` 用不了
-
-device flow **只写 token，不写** `state.api.codewhisperer.profile`。
-而上游 `GetUsageLimits` 严格要求 `profileArn`，缺了就是 `400 Invalid profileArn`。
-
-```bash
-docker compose run --rm --entrypoint /bin/sh kiro2claude -c '
-  unset KIRO2CLAUDE_API_KEY
-  script -qec "kiro-cli profile" /dev/null
-'
-```
-
-TUI 起来后按 **Enter** 接受高亮的默认 profile。
-
-> 走 `KIRO2CLAUDE_LOGIN_START_URL` 自动 bootstrap 的话这一步是自动的
-> （`runBootstrapLogin` 内部会调 `activateProfile`），但那条路只对
-> IAM Identity Center 有效 —— Builder ID 必须手动跑这两步。
-
-### 3. 启动
-
-```bash
-docker compose up -d
-docker compose logs -f          # 应看到「启动自检完成：凭据就绪」
-```
+手动登录必须在 `up -d` **之前**：没有凭据时 `loadCredentialsFromEnv()` 抛错 →
+`process.exit(1)`，配上 `restart: unless-stopped` 就是无限重启循环。
 
 ---
 
